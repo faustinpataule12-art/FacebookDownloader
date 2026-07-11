@@ -21,6 +21,8 @@ android {
             // embarquer plusieurs architectures.
             abiFilters += listOf("arm64-v8a")
         }
+
+        resourceConfigurations += listOf("en", "fr")
     }
 
     buildTypes {
