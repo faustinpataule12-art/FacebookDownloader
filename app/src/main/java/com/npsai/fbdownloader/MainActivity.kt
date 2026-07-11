@@ -12,16 +12,14 @@ import android.view.animation.AnimationSet
 import android.view.animation.ScaleAnimation
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.widget.NestedScrollView
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
-import com.yausername.youtubedl_android.mapper.VideoFormat
-import com.yausername.youtubedl_android.mapper.VideoInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 import java.util.Locale
 
@@ -29,11 +27,21 @@ import java.util.Locale
  * Facebook Downloader
  * Créer par NPS.NELSON
  *
- * Flux : coller un lien -> rechercher -> choisir un format vidéo (MP4)
- * ou audio (MP3) parmi ceux réellement disponibles pour cette vidéo,
- * avec la taille exacte -> télécharger. Le fichier final est toujours
- * préfixé "NPS_" (signature).
+ * On récupère les infos de la vidéo en demandant à yt-dlp de sortir un JSON
+ * brut (--dump-json) puis on le parse nous-mêmes avec org.json. C'est plus
+ * fiable que de dépendre des classes internes de la librairie, dont les noms
+ * de champs peuvent changer d'une version à l'autre.
  */
+
+data class FormatItem(
+    val formatId: String,
+    val height: Int?,
+    val abr: Double?,
+    val vcodec: String?,
+    val acodec: String?,
+    val filesizeBytes: Long?
+)
+
 class MainActivity : AppCompatActivity() {
 
     private lateinit var editLink: EditText
@@ -55,8 +63,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var buttonWhatsapp: ImageButton
     private lateinit var viewPulse: View
 
-    private var videoInfo: VideoInfo? = null
-    private var selectedFormat: VideoFormat? = null
+    private var videoTitle: String = "Vidéo"
+    private var selectedFormat: FormatItem? = null
     private var selectedIsAudio = false
 
     companion object {
@@ -76,12 +84,8 @@ class MainActivity : AppCompatActivity() {
         buttonSettings.setOnClickListener { ouvrirParametres() }
         buttonWhatsapp.setOnClickListener { ouvrirWhatsappContact() }
         buttonDownload.setOnClickListener { telechargerFormatSelectionne() }
-        headerVideoSection.setOnClickListener {
-            toggleSection(listVideoFormats)
-        }
-        headerAudioSection.setOnClickListener {
-            toggleSection(listAudioFormats)
-        }
+        headerVideoSection.setOnClickListener { toggleSection(listVideoFormats) }
+        headerAudioSection.setOnClickListener { toggleSection(listAudioFormats) }
     }
 
     private fun bindViews() {
@@ -123,30 +127,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ouvrirWhatsappContact() {
-        val intent = Intent(
-            Intent.ACTION_VIEW,
-            Uri.parse("https://wa.me/$WHATSAPP_CONTACT_NUMBER")
+        startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/$WHATSAPP_CONTACT_NUMBER"))
         )
-        startActivity(intent)
     }
 
     // ---------- Paramètres ----------
     private fun ouvrirParametres() {
         val dialog = BottomSheetDialog(this)
-        val view = LayoutInflater.from(this)
-            .inflate(R.layout.bottom_sheet_settings, null)
+        val view = LayoutInflater.from(this).inflate(R.layout.bottom_sheet_settings, null)
         dialog.setContentView(view)
 
         view.findViewById<ImageButton>(R.id.buttonCloseSettings)
             .setOnClickListener { dialog.dismiss() }
 
-        view.findViewById<LinearLayout>(R.id.buttonAbout)
-            .setOnClickListener {
-                startActivity(
-                    Intent(Intent.ACTION_VIEW, Uri.parse(WHATSAPP_ABOUT_LINK))
-                )
-                dialog.dismiss()
-            }
+        view.findViewById<LinearLayout>(R.id.buttonAbout).setOnClickListener {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(WHATSAPP_ABOUT_LINK)))
+            dialog.dismiss()
+        }
 
         dialog.show()
     }
@@ -166,11 +164,20 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             try {
-                val info = withContext(Dispatchers.IO) {
-                    YoutubeDL.getInstance().getInfo(url)
+                val json = withContext(Dispatchers.IO) {
+                    val request = YoutubeDLRequest(url).apply {
+                        addOption("--dump-json")
+                        addOption("--no-warnings")
+                        addOption("--no-playlist")
+                    }
+                    val response = YoutubeDL.getInstance().execute(request)
+                    response.out
                 }
-                videoInfo = info
-                afficherResultats(info)
+
+                val (titre, videoFormats, audioFormats) = parserFormats(json)
+                videoTitle = titre
+                afficherResultats(titre, videoFormats, audioFormats)
+
             } catch (e: Exception) {
                 progressSearch.visibility = View.GONE
                 textHint.visibility = View.VISIBLE
@@ -180,46 +187,87 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun afficherResultats(info: VideoInfo) {
-        progressSearch.visibility = View.GONE
-        layoutResultats.visibility = View.VISIBLE
-        textVideoTitle.text = info.title ?: "Vidéo trouvée"
+    /**
+     * Parse le JSON brut renvoyé par yt-dlp (--dump-json) et sépare
+     * les formats vidéo (avec image) des formats audio seul.
+     */
+    private fun parserFormats(rawJson: String): Triple<String, List<FormatItem>, List<FormatItem>> {
+        // yt-dlp peut parfois écrire des warnings avant le JSON ; on prend
+        // la dernière ligne qui commence par '{'.
+        val jsonLine = rawJson.lines().lastOrNull { it.trim().startsWith("{") }
+            ?: rawJson
+        val root = JSONObject(jsonLine)
+        val titre = if (root.has("title")) root.getString("title") else "Vidéo"
 
-        val formats = info.formats ?: emptyList()
+        val videoFormats = mutableListOf<FormatItem>()
+        val audioFormats = mutableListOf<FormatItem>()
 
-        // Formats vidéo : ceux qui ont un flux vidéo (vcodec renseigné et != "none")
-        val videoFormats = formats
-            .filter { it.vcodec != null && it.vcodec != "none" }
+        val formatsArray = root.optJSONArray("formats")
+        if (formatsArray != null) {
+            for (i in 0 until formatsArray.length()) {
+                val f = formatsArray.optJSONObject(i) ?: continue
+                val formatId = f.optString("format_id", null.toString())
+                val vcodec = if (f.isNull("vcodec")) null else f.optString("vcodec", null)
+                val acodec = if (f.isNull("acodec")) null else f.optString("acodec", null)
+                val height = if (f.has("height") && !f.isNull("height")) f.optInt("height") else null
+                val abr = if (f.has("abr") && !f.isNull("abr")) f.optDouble("abr") else null
+                val filesize = when {
+                    f.has("filesize") && !f.isNull("filesize") -> f.optLong("filesize")
+                    f.has("filesize_approx") && !f.isNull("filesize_approx") -> f.optLong("filesize_approx")
+                    else -> null
+                }
+
+                val item = FormatItem(formatId, height, abr, vcodec, acodec, filesize)
+
+                val hasVideo = vcodec != null && vcodec != "none"
+                val hasAudio = acodec != null && acodec != "none"
+
+                if (hasVideo) {
+                    videoFormats.add(item)
+                } else if (hasAudio) {
+                    audioFormats.add(item)
+                }
+            }
+        }
+
+        val videosTries = videoFormats
             .distinctBy { it.height }
             .sortedBy { it.height ?: 0 }
 
-        // Formats audio seul : pas de vidéo mais un flux audio
-        val audioFormats = formats
-            .filter { (it.vcodec == null || it.vcodec == "none") && it.acodec != null && it.acodec != "none" }
+        val audiosTries = audioFormats
             .distinctBy { it.abr }
             .sortedBy { it.abr ?: 0.0 }
 
-        remplirListe(
-            listVideoFormats, videoFormats, isAudio = false,
-            libelle = { f -> "${f.height ?: "?"}p${if ((f.height ?: 0) >= 720) " HD" else ""}" }
-        )
-        remplirListe(
-            listAudioFormats, audioFormats, isAudio = true,
-            libelle = { f -> "${f.abr?.toInt() ?: "?"} kbps" }
-        )
+        return Triple(titre, videosTries, audiosTries)
+    }
+
+    private fun afficherResultats(
+        titre: String,
+        videoFormats: List<FormatItem>,
+        audioFormats: List<FormatItem>
+    ) {
+        progressSearch.visibility = View.GONE
+        layoutResultats.visibility = View.VISIBLE
+        textVideoTitle.text = titre
+
+        remplirListe(listVideoFormats, videoFormats, isAudio = false)
+        remplirListe(listAudioFormats, audioFormats, isAudio = true)
 
         if (videoFormats.isNotEmpty()) {
             selectedFormat = videoFormats.last()
             selectedIsAudio = false
+            mettreAJourBadges()
+        } else if (audioFormats.isNotEmpty()) {
+            selectedFormat = audioFormats.last()
+            selectedIsAudio = true
             mettreAJourBadges()
         }
     }
 
     private fun remplirListe(
         conteneur: LinearLayout,
-        liste: List<VideoFormat>,
-        isAudio: Boolean,
-        libelle: (VideoFormat) -> String
+        liste: List<FormatItem>,
+        isAudio: Boolean
     ) {
         conteneur.removeAllViews()
         if (liste.isEmpty()) {
@@ -234,6 +282,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         for (format in liste) {
+            val libelle = if (isAudio) {
+                "${format.abr?.toInt() ?: "?"} kbps"
+            } else {
+                val h = format.height ?: 0
+                "${h}p${if (h >= 720) " HD" else ""}"
+            }
+
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = android.view.Gravity.CENTER_VERTICAL
@@ -248,16 +303,14 @@ class MainActivity : AppCompatActivity() {
             }
 
             val label = TextView(this).apply {
-                text = libelle(format)
+                text = libelle
                 setTextColor(getColor(R.color.neutral_700))
                 textSize = 14f
-                layoutParams = LinearLayout.LayoutParams(
-                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
-                )
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
 
             val size = TextView(this).apply {
-                text = formaterTaille(format.filesize ?: format.filesizeApprox)
+                text = formaterTaille(format.filesizeBytes)
                 setTextColor(getColor(R.color.neutral_400))
                 textSize = 12f
             }
@@ -295,11 +348,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toggleSection(section: LinearLayout) {
-        section.visibility = if (section.visibility == View.VISIBLE) {
-            View.GONE
-        } else {
-            View.VISIBLE
-        }
+        section.visibility = if (section.visibility == View.VISIBLE) View.GONE else View.VISIBLE
     }
 
     private fun formaterTaille(bytes: Long?): String {
@@ -310,7 +359,6 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- Téléchargement ----------
     private fun telechargerFormatSelectionne() {
-        val info = videoInfo ?: return
         val format = selectedFormat
         if (format == null) {
             Toast.makeText(this, "Choisis un format d'abord", Toast.LENGTH_SHORT).show()
@@ -318,7 +366,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val url = editLink.text.toString().trim()
-        val titreBrut = (info.title ?: "video").replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        val titreBrut = videoTitle.replace(Regex("[\\\\/:*?\"<>|]"), "_")
         val extension = if (selectedIsAudio) "mp3" else "mp4"
         val nomFichier = "NPS_$titreBrut.$extension"
 
@@ -338,7 +386,7 @@ class MainActivity : AppCompatActivity() {
                     addOption("-o", File(dossier, nomFichier).absolutePath)
                     addOption("--restrict-filenames")
                     if (selectedIsAudio) {
-                        addOption("-f", format.formatId ?: "bestaudio")
+                        addOption("-f", format.formatId)
                         addOption("-x")
                         addOption("--audio-format", "mp3")
                     } else {
@@ -353,7 +401,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                textStatus.text = "Terminé ! Enregistré : ${nomFichier}"
+                textStatus.text = "Terminé ! Enregistré : $nomFichier"
                 Toast.makeText(this@MainActivity, "Téléchargement réussi", Toast.LENGTH_LONG).show()
 
             } catch (e: Exception) {
