@@ -24,7 +24,7 @@ import java.io.File
 import java.util.Locale
 
 /**
- * Facebook Downloader
+ * All Video Downloader
  * Créer par NPS.NELSON
  *
  * On récupère les infos de la vidéo en demandant à yt-dlp de sortir un JSON
@@ -39,7 +39,8 @@ data class FormatItem(
     val abr: Double?,
     val vcodec: String?,
     val acodec: String?,
-    val filesizeBytes: Long?
+    val filesizeBytes: Long?,
+    val ext: String
 )
 
 class MainActivity : AppCompatActivity() {
@@ -216,8 +217,9 @@ class MainActivity : AppCompatActivity() {
                     f.has("filesize_approx") && !f.isNull("filesize_approx") -> f.optLong("filesize_approx")
                     else -> null
                 }
+                val ext = if (f.has("ext") && !f.isNull("ext")) f.optString("ext") else "mp4"
 
-                val item = FormatItem(formatId, height, abr, vcodec, acodec, filesize)
+                val item = FormatItem(formatId, height, abr, vcodec, acodec, filesize, ext)
 
                 val hasVideo = vcodec != null && vcodec != "none"
                 val hasAudio = acodec != null && acodec != "none"
