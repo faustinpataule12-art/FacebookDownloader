@@ -13,6 +13,14 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        ndk {
+            // Une seule architecture : arm64-v8a couvre la quasi-totalité
+            // des téléphones Android actuels (dont le Tecno Spark 10).
+            // Ça réduit fortement la taille de l'APK par rapport à
+            // embarquer plusieurs architectures.
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
