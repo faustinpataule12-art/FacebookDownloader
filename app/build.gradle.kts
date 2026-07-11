@@ -44,6 +44,7 @@ dependencies {
     implementation("androidx.coordinatorlayout:coordinatorlayout:1.2.0")
 
     // Librairie yt-dlp pour Android (télécharge Facebook, Twitter/X, YouTube, etc.)
+    // Anciennement sur JitPack (com.github.yausername...), migrée vers Maven Central.
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
 
